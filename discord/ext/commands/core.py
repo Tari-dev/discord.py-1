@@ -51,8 +51,10 @@ from .errors import *
 from .cooldowns import Cooldown, BucketType, CooldownMapping, MaxConcurrency, DynamicCooldownMapping
 from .converter import run_converters, get_converter, Greedy
 from ._types import _BaseCommand
+from . import default as defaults
 from .cog import Cog
 from .context import Context
+
 
 
 if TYPE_CHECKING:
@@ -564,6 +566,19 @@ class Command(_BaseCommand, Generic[CogT, P, T]):
                     await wrapped(ctx, error)
         finally:
             ctx.bot.dispatch('command_error', ctx, error)
+            
+    async def _resolve_default(self, ctx, param):
+        try:
+            if inspect.isclass(param.default) and issubclass(param.default, defaults.CustomDefault):
+                instance = param.default()
+                return await instance.default(ctx=ctx, param=param)
+            elif isinstance(param.default, defaults.CustomDefault):
+                return await param.default.default(ctx=ctx, param=param)
+        except CommandError as e:
+            raise e
+        except Exception as e:
+            raise ConversionError(param.default, e) from e
+        return param.default
 
     async def transform(self, ctx: Context[BotT], param: inspect.Parameter) -> Any:
         required = param.default is param.empty
@@ -594,7 +609,7 @@ class Command(_BaseCommand, Generic[CogT, P, T]):
                 if hasattr(converter, '__commands_is_flag__') and converter._can_be_constructible():
                     return await converter._construct_default(ctx)
                 raise MissingRequiredArgument(param)
-            return param.default
+            return await self._resolve_default(ctx, param)
 
         previous = view.index
         if consume_rest_is_special:
@@ -646,7 +661,7 @@ class Command(_BaseCommand, Generic[CogT, P, T]):
             view.index = previous
             raise RuntimeError() from None  # break loop
         else:
-            return value
+            return value or await self._resolve_default(ctx, param)
 
     @property
     def clean_params(self) -> Dict[str, inspect.Parameter]:
