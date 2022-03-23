@@ -24,8 +24,8 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 import itertools
-import copy
 import functools
 import re
 
@@ -33,12 +33,12 @@ from typing import (
     TYPE_CHECKING,
     Optional,
     Generator,
+    Generic,
     List,
     TypeVar,
     Callable,
     Any,
     Dict,
-    Tuple,
     Iterable,
     Sequence,
     Mapping,
@@ -50,21 +50,14 @@ from .core import Group, Command, get_signature_parameters
 from .errors import CommandError
 
 if TYPE_CHECKING:
-    from typing_extensions import Self
     import inspect
 
     import discord.abc
 
+    from ._types import Coro
     from .bot import BotBase
-    from .context import Context
     from .cog import Cog
-
-    from ._types import (
-        Check,
-        ContextT,
-        BotT,
-        _Bot,
-    )
+    from .context import Context
 
 __all__ = (
     'Paginator',
@@ -73,7 +66,11 @@ __all__ = (
     'MinimalHelpCommand',
 )
 
+T = TypeVar('T')
+
+ContextT = TypeVar('ContextT', bound='Context')
 FuncT = TypeVar('FuncT', bound=Callable[..., Any])
+HelpCommandCommand = Command[Optional['Cog'], ... if TYPE_CHECKING else Any, Any]
 
 MISSING: Any = discord.utils.MISSING
 
@@ -219,91 +216,11 @@ def _not_overridden(f: FuncT) -> FuncT:
     return f
 
 
-class _HelpCommandImpl(Command):
-    def __init__(self, inject: HelpCommand, *args: Any, **kwargs: Any) -> None:
-        super().__init__(inject.command_callback, *args, **kwargs)
-        self._original: HelpCommand = inject
-        self._injected: HelpCommand = inject
-        self.params: Dict[str, inspect.Parameter] = get_signature_parameters(
-            inject.command_callback, globals(), skip_parameters=1
-        )
-
-    async def prepare(self, ctx: Context[Any]) -> None:
-        self._injected = injected = self._original.copy()
-        injected.context = ctx
-        self.callback = injected.command_callback
-        self.params = get_signature_parameters(injected.command_callback, globals(), skip_parameters=1)
-
-        on_error = injected.on_help_command_error
-        if not hasattr(on_error, '__help_command_not_overridden__'):
-            if self.cog is not None:
-                self.on_error = self._on_error_cog_implementation
-            else:
-                self.on_error = on_error
-
-        await super().prepare(ctx)
-
-    async def _parse_arguments(self, ctx: Context[BotT]) -> None:
-        # Make the parser think we don't have a cog so it doesn't
-        # inject the parameter into `ctx.args`.
-        original_cog = self.cog
-        self.cog = None
-        try:
-            await super()._parse_arguments(ctx)
-        finally:
-            self.cog = original_cog
-
-    async def _on_error_cog_implementation(self, _, ctx: Context[BotT], error: CommandError) -> None:
-        await self._injected.on_help_command_error(ctx, error)
-
-    def _inject_into_cog(self, cog: Cog) -> None:
-        # Warning: hacky
-
-        # Make the cog think that get_commands returns this command
-        # as well if we inject it without modifying __cog_commands__
-        # since that's used for the injection and ejection of cogs.
-        def wrapped_get_commands(
-            *, _original: Callable[[], List[Command[Any, ..., Any]]] = cog.get_commands
-        ) -> List[Command[Any, ..., Any]]:
-            ret = _original()
-            ret.append(self)
-            return ret
-
-        # Ditto here
-        def wrapped_walk_commands(
-            *, _original: Callable[[], Generator[Command[Any, ..., Any], None, None]] = cog.walk_commands
-        ):
-            yield from _original()
-            yield self
-
-        functools.update_wrapper(wrapped_get_commands, cog.get_commands)
-        functools.update_wrapper(wrapped_walk_commands, cog.walk_commands)
-        cog.get_commands = wrapped_get_commands
-        cog.walk_commands = wrapped_walk_commands
-        self.cog = cog
-
-    def _eject_cog(self) -> None:
-        if self.cog is None:
-            return
-
-        # revert back into their original methods
-        cog = self.cog
-        cog.get_commands = cog.get_commands.__wrapped__
-        cog.walk_commands = cog.walk_commands.__wrapped__
-        self.cog = None
+_context: ContextVar[Optional[Context]] = ContextVar('context', default=None)
 
 
-class HelpCommand:
+class HelpCommand(HelpCommandCommand, Generic[ContextT]):
     r"""The base implementation for help command formatting.
-
-    .. note::
-
-        Internally instances of this class are deep copied every time
-        the command itself is invoked to prevent a race condition
-        mentioned in :issue:`2123`.
-
-        This means that relying on the state of this class to be
-        the same between command invocations would not work as expected.
 
     Attributes
     ------------
@@ -336,88 +253,67 @@ class HelpCommand:
 
     MENTION_PATTERN = re.compile('|'.join(MENTION_TRANSFORMS.keys()))
 
-    if TYPE_CHECKING:
-        __original_kwargs__: Dict[str, Any]
-        __original_args__: Tuple[Any, ...]
-
-    def __new__(cls, *args: Any, **kwargs: Any) -> Self:
-        # To prevent race conditions of a single instance while also allowing
-        # for settings to be passed the original arguments passed must be assigned
-        # to allow for easier copies (which will be made when the help command is actually called)
-        # see issue 2123
-        self = super().__new__(cls)
-
-        # Shallow copies cannot be used in this case since it is not unusual to pass
-        # instances that need state, e.g. Paginator or what have you into the function
-        # The keys can be safely copied as-is since they're 99.99% certain of being
-        # string keys
-        deepcopy = copy.deepcopy
-        self.__original_kwargs__ = {k: deepcopy(v) for k, v in kwargs.items()}
-        self.__original_args__ = deepcopy(args)
-        return self
-
-    def __init__(self, **options: Any) -> None:
-        self.show_hidden: bool = options.pop('show_hidden', False)
-        self.verify_checks: bool = options.pop('verify_checks', True)
+    def __init__(
+        self,
+        *,
+        show_hidden: bool = False,
+        verify_checks: bool = True,
+        command_attrs: Dict[str, Any] = MISSING,
+    ) -> None:
+        self.show_hidden: bool = show_hidden
+        self.verify_checks: bool = verify_checks
         self.command_attrs: Dict[str, Any]
-        self.command_attrs = attrs = options.pop('command_attrs', {})
+        self.command_attrs = attrs = command_attrs if command_attrs is not MISSING else {}
         attrs.setdefault('name', 'help')
         attrs.setdefault('help', 'Shows this message')
-        self.context: Context[_Bot] = MISSING
-        self._command_impl = _HelpCommandImpl(self, **self.command_attrs)
+        self._cog: Optional[Cog] = None
+        super().__init__(self._set_context, **attrs)
+        self.params: Dict[str, inspect.Parameter] = get_signature_parameters(
+            self.command_callback, globals(), skip_parameters=1
+        )
+        if not hasattr(self.on_help_command_error, '__help_command_not_overridden__'):
+            self.on_error = self.on_help_command_error
 
-    def copy(self) -> Self:
-        obj = self.__class__(*self.__original_args__, **self.__original_kwargs__)
-        obj._command_impl = self._command_impl
-        return obj
+    async def __call__(self, context: ContextT, /, *args: Any, **kwargs: Any) -> Any:
+        return await self._set_context(context, *args, **kwargs)
+
+    async def _set_context(self, context: ContextT, *args: Any, **kwargs: Any) -> Any:
+        _context.set(context)
+        return await self.command_callback(context, *args, **kwargs)
+
+    @property
+    def context(self) -> ContextT:
+        ctx = _context.get()
+        if ctx is None:
+            raise AttributeError('context attribute cannot be accessed in non command-invocation contexts.')
+        return ctx  # type: ignore
 
     def _add_to_bot(self, bot: BotBase) -> None:
-        command = _HelpCommandImpl(self, **self.command_attrs)
-        bot.add_command(command)
-        self._command_impl = command
+        bot.add_command(self)  # type: ignore
 
     def _remove_from_bot(self, bot: BotBase) -> None:
-        bot.remove_command(self._command_impl.name)
-        self._command_impl._eject_cog()
+        bot.remove_command(self.name)
+        self._eject_cog()
 
-    def add_check(self, func: Check[ContextT], /) -> None:
-        """
-        Adds a check to the help command.
+    async def _call_without_cog(self, callback: Callable[[ContextT], Coro[T]], ctx: ContextT) -> T:
+        cog = self._cog
+        self.cog = None
+        try:
+            return await callback(ctx)
+        finally:
+            self.cog = cog
 
-        .. versionadded:: 1.4
+    async def _parse_arguments(self, ctx: ContextT) -> None:
+        return await self._call_without_cog(super()._parse_arguments, ctx)
 
-        .. versionchanged:: 2.0
+    async def call_before_hooks(self, ctx: ContextT, /) -> None:
+        return await self._call_without_cog(super().call_before_hooks, ctx)
 
-            ``func`` parameter is now positional-only.
+    async def call_after_hooks(self, ctx: ContextT, /) -> None:
+        return await self._call_without_cog(super().call_after_hooks, ctx)
 
-        Parameters
-        ----------
-        func
-            The function that will be used as a check.
-        """
-
-        self._command_impl.add_check(func)
-
-    def remove_check(self, func: Check[ContextT], /) -> None:
-        """
-        Removes a check from the help command.
-
-        This function is idempotent and will not raise an exception if
-        the function is not in the command's checks.
-
-        .. versionadded:: 1.4
-
-        .. versionchanged:: 2.0
-
-            ``func`` parameter is now positional-only.
-
-        Parameters
-        ----------
-        func
-            The function to remove from the checks.
-        """
-
-        self._command_impl.remove_check(func)
+    async def can_run(self, ctx: ContextT, /) -> bool:
+        return await self._call_without_cog(super().can_run, ctx)
 
     def get_bot_mapping(self) -> Dict[Optional[Cog], List[Command[Any, ..., Any]]]:
         """Retrieves the bot mapping passed to :meth:`send_bot_help`."""
@@ -441,14 +337,18 @@ class HelpCommand:
         Optional[:class:`str`]
             The command name that triggered this invocation.
         """
-        command_name = self._command_impl.name
+        command_name = self.name
         ctx = self.context
         if ctx is MISSING or ctx.command is None or ctx.command.qualified_name != command_name:
             return command_name
         return ctx.invoked_with
 
-    def get_command_signature(self, command: Command[Any, ..., Any]) -> str:
+    def get_command_signature(self, command: Command[Any, ..., Any], /) -> str:
         """Retrieves the signature portion of the help page.
+
+        .. versionchanged:: 2.0
+
+            ``command`` parameter is now positional-only.
 
         Parameters
         ------------
@@ -482,10 +382,14 @@ class HelpCommand:
 
         return f'{self.context.clean_prefix}{alias} {command.signature}'
 
-    def remove_mentions(self, string: str) -> str:
+    def remove_mentions(self, string: str, /) -> str:
         """Removes mentions from the string to prevent abuse.
 
         This includes ``@everyone``, ``@here``, member mentions and role mentions.
+
+        .. versionchanged:: 2.0
+
+            ``string`` parameter is now positional-only.
 
         Returns
         -------
@@ -498,39 +402,73 @@ class HelpCommand:
 
         return self.MENTION_PATTERN.sub(replace, string)
 
+    async def _on_error_cog_implementation(self, _, ctx: ContextT, error: CommandError) -> None:
+        await self.on_help_command_error(ctx, error)
+
+    def _inject_into_cog(self, cog: Cog) -> None:
+        # Warning: hacky
+
+        # Make the cog think that get_commands returns this command
+        # as well if we inject it without modifying __cog_commands__
+        # since that's used for the injection and ejection of cogs.
+        def wrapped_get_commands(
+            *, _original: Callable[[], List[Command[Any, ..., Any]]] = cog.get_commands
+        ) -> List[Command[Any, ..., Any]]:
+            ret = _original()
+            ret.append(self)
+            return ret
+
+        # Ditto here
+        def wrapped_walk_commands(
+            *, _original: Callable[[], Generator[Command[Any, ..., Any], None, None]] = cog.walk_commands
+        ):
+            yield from _original()
+            yield self
+
+        functools.update_wrapper(wrapped_get_commands, cog.get_commands)
+        functools.update_wrapper(wrapped_walk_commands, cog.walk_commands)
+        cog.get_commands = wrapped_get_commands
+        cog.walk_commands = wrapped_walk_commands
+        if not hasattr(self.on_help_command_error, '__help_command_not_overridden__'):
+            self.on_error = self._on_error_cog_implementation
+        self._cog = cog
+
+    def _eject_cog(self) -> None:
+        if self._cog is None:
+            return
+
+        # revert back into their original methods
+        if not hasattr(self.on_help_command_error, '__help_command_not_overridden__'):
+            self.on_error = self.on_help_command_error
+        cog = self._cog
+        cog.get_commands = cog.get_commands.__wrapped__
+        cog.walk_commands = cog.walk_commands.__wrapped__
+        self._cog = None
+
     @property
     def cog(self) -> Optional[Cog]:
-        """A property for retrieving or setting the cog for the help command.
-
-        When a cog is set for the help command, it is as-if the help command
-        belongs to that cog. All cog special methods will apply to the help
-        command and it will be automatically unset on unload.
-
-        To unbind the cog from the help command, you can set it to ``None``.
-
-        Returns
-        --------
-        Optional[:class:`Cog`]
-            The cog that is currently set for the help command.
-        """
-        return self._command_impl.cog
+        return self._cog
 
     @cog.setter
     def cog(self, cog: Optional[Cog]) -> None:
         # Remove whatever cog is currently valid, if any
-        self._command_impl._eject_cog()
+        self._eject_cog()
 
         # If a new cog is set then inject it.
         if cog is not None:
-            self._command_impl._inject_into_cog(cog)
+            self._inject_into_cog(cog)
 
-    def command_not_found(self, string: str) -> str:
+    def command_not_found(self, string: str, /) -> str:
         """|maybecoro|
 
         A method called when a command is not found in the help command.
         This is useful to override for i18n.
 
         Defaults to ``No command called {0} found.``
+
+        .. versionchanged:: 2.0
+
+            ``string`` parameter is now positional-only.
 
         Parameters
         ------------
@@ -545,7 +483,7 @@ class HelpCommand:
         """
         return f'No command called "{string}" found.'
 
-    def subcommand_not_found(self, command: Command[Any, ..., Any], string: str) -> str:
+    def subcommand_not_found(self, command: Command[Any, ..., Any], string: str, /) -> str:
         """|maybecoro|
 
         A method called when a command did not have a subcommand requested in the help command.
@@ -557,6 +495,10 @@ class HelpCommand:
             - If there is no subcommand in the ``command`` parameter.
         - ``'Command "{command.qualified_name}" has no subcommand named {string}'``
             - If the ``command`` parameter has subcommands but not one named ``string``.
+
+        .. versionchanged:: 2.0
+
+            ``command`` and ``string`` parameters are now positional-only.
 
         Parameters
         ------------
@@ -578,6 +520,7 @@ class HelpCommand:
     async def filter_commands(
         self,
         commands: Iterable[Command[Any, ..., Any]],
+        /,
         *,
         sort: bool = False,
         key: Optional[Callable[[Command[Any, ..., Any]], Any]] = None,
@@ -588,6 +531,10 @@ class HelpCommand:
 
         This takes into account the :attr:`verify_checks` and :attr:`show_hidden`
         attributes.
+
+        .. versionchanged:: 2.0
+
+            ``commands`` parameter is now positional-only.
 
         Parameters
         ------------
@@ -637,8 +584,12 @@ class HelpCommand:
             ret.sort(key=key)
         return ret
 
-    def get_max_size(self, commands: Sequence[Command[Any, ..., Any]]) -> int:
+    def get_max_size(self, commands: Sequence[Command[Any, ..., Any]], /) -> int:
         """Returns the largest name length of the specified command list.
+
+        .. versionchanged:: 2.0
+
+            ``commands`` parameter is now positional-only.
 
         Parameters
         ------------
@@ -668,7 +619,7 @@ class HelpCommand:
         """
         return self.context.channel
 
-    async def send_error_message(self, error: str) -> None:
+    async def send_error_message(self, error: str, /) -> None:
         """|coro|
 
         Handles the implementation when an error happens in the help command.
@@ -683,6 +634,10 @@ class HelpCommand:
 
             You can access the invocation context with :attr:`HelpCommand.context`.
 
+        .. versionchanged:: 2.0
+
+            ``error`` parameter is now positional-only.
+
         Parameters
         ------------
         error: :class:`str`
@@ -693,7 +648,7 @@ class HelpCommand:
         await destination.send(error)
 
     @_not_overridden
-    async def on_help_command_error(self, ctx: Context[BotT], error: CommandError) -> None:
+    async def on_help_command_error(self, ctx: ContextT, error: CommandError, /) -> None:
         """|coro|
 
         The help command's error handler, as specified by :ref:`ext_commands_error_handler`.
@@ -704,6 +659,10 @@ class HelpCommand:
         By default this method does nothing and just propagates to the default
         error handlers.
 
+        .. versionchanged:: 2.0
+
+            ``ctx`` and ``error`` parameters are now positional-only.
+
         Parameters
         ------------
         ctx: :class:`Context`
@@ -713,7 +672,7 @@ class HelpCommand:
         """
         pass
 
-    async def send_bot_help(self, mapping: Mapping[Optional[Cog], List[Command[Any, ..., Any]]]) -> None:
+    async def send_bot_help(self, mapping: Mapping[Optional[Cog], List[Command[Any, ..., Any]]], /) -> None:
         """|coro|
 
         Handles the implementation of the bot command page in the help command.
@@ -733,6 +692,10 @@ class HelpCommand:
             Also, the commands in the mapping are not filtered. To do the filtering
             you will have to call :meth:`filter_commands` yourself.
 
+        .. versionchanged:: 2.0
+
+            ``mapping`` parameter is now positional-only.
+
         Parameters
         ------------
         mapping: Mapping[Optional[:class:`Cog`], List[:class:`Command`]]
@@ -742,7 +705,7 @@ class HelpCommand:
         """
         return None
 
-    async def send_cog_help(self, cog: Cog) -> None:
+    async def send_cog_help(self, cog: Cog, /) -> None:
         """|coro|
 
         Handles the implementation of the cog page in the help command.
@@ -763,6 +726,10 @@ class HelpCommand:
             The commands returned not filtered. To do the filtering you will have to call
             :meth:`filter_commands` yourself.
 
+        .. versionchanged:: 2.0
+
+            ``cog`` parameter is now positional-only.
+
         Parameters
         -----------
         cog: :class:`Cog`
@@ -770,7 +737,7 @@ class HelpCommand:
         """
         return None
 
-    async def send_group_help(self, group: Group[Any, ..., Any]) -> None:
+    async def send_group_help(self, group: Group[Any, ..., Any], /) -> None:
         """|coro|
 
         Handles the implementation of the group page in the help command.
@@ -791,6 +758,10 @@ class HelpCommand:
             :attr:`Group.commands`. The commands returned not filtered. To do the
             filtering you will have to call :meth:`filter_commands` yourself.
 
+        .. versionchanged:: 2.0
+
+            ``group`` parameter is now positional-only.
+
         Parameters
         -----------
         group: :class:`Group`
@@ -798,7 +769,7 @@ class HelpCommand:
         """
         return None
 
-    async def send_command_help(self, command: Command[Any, ..., Any]) -> None:
+    async def send_command_help(self, command: Command[Any, ..., Any], /) -> None:
         """|coro|
 
         Handles the implementation of the single command page in the help command.
@@ -829,6 +800,10 @@ class HelpCommand:
             There are more than just these attributes but feel free to play around with
             these to help you get started to get the output that you want.
 
+        .. versionchanged:: 2.0
+
+            ``command`` parameter is now positional-only.
+
         Parameters
         -----------
         command: :class:`Command`
@@ -836,7 +811,7 @@ class HelpCommand:
         """
         return None
 
-    async def prepare_help_command(self, ctx: Context[BotT], command: Optional[str] = None) -> None:
+    async def prepare_help_command(self, ctx: ContextT, command: Optional[str] = None, /) -> None:
         """|coro|
 
         A low level method that can be used to prepare the help command
@@ -851,6 +826,10 @@ class HelpCommand:
             This is called *inside* the help command callback body. So all
             the usual rules that happen inside apply here as well.
 
+        .. versionchanged:: 2.0
+
+            ``ctx`` and ``command`` parameters are now positional-only.
+
         Parameters
         -----------
         ctx: :class:`Context`
@@ -860,7 +839,7 @@ class HelpCommand:
         """
         pass
 
-    async def command_callback(self, ctx: Context[BotT], *, command: Optional[str] = None) -> None:
+    async def command_callback(self, ctx: ContextT, /, *, command: Optional[str] = None) -> Any:
         """|coro|
 
         The actual implementation of the help command.
@@ -878,8 +857,13 @@ class HelpCommand:
         - :meth:`send_error_message`
         - :meth:`on_help_command_error`
         - :meth:`prepare_help_command`
+
+        .. versionchanged:: 2.0
+
+            ``ctx`` parameter is now positional-only.
         """
         await self.prepare_help_command(ctx, command)
+
         bot = ctx.bot
 
         if command is None:
@@ -905,7 +889,7 @@ class HelpCommand:
 
         for key in keys[1:]:
             try:
-                found = cmd.all_commands.get(key)  # type: ignore
+                found = cmd.all_commands.get(key)
             except AttributeError:
                 string = await maybe_coro(self.subcommand_not_found, cmd, self.remove_mentions(key))
                 return await self.send_error_message(string)
@@ -921,7 +905,7 @@ class HelpCommand:
             return await self.send_command_help(cmd)
 
 
-class DefaultHelpCommand(HelpCommand):
+class DefaultHelpCommand(HelpCommand[ContextT]):
     """The implementation of the default help command.
 
     This inherits from :class:`HelpCommand`.
@@ -972,8 +956,13 @@ class DefaultHelpCommand(HelpCommand):
 
         super().__init__(**options)
 
-    def shorten_text(self, text: str) -> str:
-        """:class:`str`: Shortens text to fit into the :attr:`width`."""
+    def shorten_text(self, text: str, /) -> str:
+        """:class:`str`: Shortens text to fit into the :attr:`width`.
+
+        .. versionchanged:: 2.0
+
+            ``text`` parameter is now positional-only.
+        """
         if len(text) > self.width:
             return text[: self.width - 3].rstrip() + '...'
         return text
@@ -987,7 +976,7 @@ class DefaultHelpCommand(HelpCommand):
         )
 
     def add_indented_commands(
-        self, commands: Sequence[Command[Any, ..., Any]], *, heading: str, max_size: Optional[int] = None
+        self, commands: Sequence[Command[Any, ..., Any]], /, *, heading: str, max_size: Optional[int] = None
     ) -> None:
         """Indents a list of commands after the specified heading.
 
@@ -997,6 +986,10 @@ class DefaultHelpCommand(HelpCommand):
         :attr:`indent` spaces, padded to ``max_size`` followed by
         the command's :attr:`Command.short_doc` and then shortened
         to fit into the :attr:`width`.
+
+        .. versionchanged:: 2.0
+
+            ``commands`` parameter is now positional-only.
 
         Parameters
         -----------
@@ -1030,8 +1023,12 @@ class DefaultHelpCommand(HelpCommand):
         for page in self.paginator.pages:
             await destination.send(page)
 
-    def add_command_formatting(self, command: Command[Any, ..., Any]) -> None:
+    def add_command_formatting(self, command: Command[Any, ..., Any], /) -> None:
         """A utility function to format the non-indented block of commands and groups.
+
+        .. versionchanged:: 2.0
+
+            ``command`` parameter is now positional-only.
 
         Parameters
         ------------
@@ -1062,11 +1059,11 @@ class DefaultHelpCommand(HelpCommand):
         else:
             return ctx.channel
 
-    async def prepare_help_command(self, ctx: Context[BotT], command: str) -> None:
+    async def prepare_help_command(self, ctx: ContextT, command: Optional[str] = None, /) -> None:
         self.paginator.clear()
         await super().prepare_help_command(ctx, command)
 
-    async def send_bot_help(self, mapping: Mapping[Optional[Cog], List[Command[Any, ..., Any]]]) -> None:
+    async def send_bot_help(self, mapping: Mapping[Optional[Cog], List[Command[Any, ..., Any]]], /) -> None:
         ctx = self.context
         bot = ctx.bot
 
@@ -1096,12 +1093,12 @@ class DefaultHelpCommand(HelpCommand):
 
         await self.send_pages()
 
-    async def send_command_help(self, command: Command[Any, ..., Any]) -> None:
+    async def send_command_help(self, command: Command[Any, ..., Any], /) -> None:
         self.add_command_formatting(command)
         self.paginator.close_page()
         await self.send_pages()
 
-    async def send_group_help(self, group: Group[Any, ..., Any]) -> None:
+    async def send_group_help(self, group: Group[Any, ..., Any], /) -> None:
         self.add_command_formatting(group)
 
         filtered = await self.filter_commands(group.commands, sort=self.sort_commands)
@@ -1115,7 +1112,7 @@ class DefaultHelpCommand(HelpCommand):
 
         await self.send_pages()
 
-    async def send_cog_help(self, cog: Cog) -> None:
+    async def send_cog_help(self, cog: Cog, /) -> None:
         if cog.description:
             self.paginator.add_line(cog.description, empty=True)
 
@@ -1130,7 +1127,7 @@ class DefaultHelpCommand(HelpCommand):
         await self.send_pages()
 
 
-class MinimalHelpCommand(HelpCommand):
+class MinimalHelpCommand(HelpCommand[ContextT]):
     """An implementation of a help command with minimal output.
 
     This inherits from :class:`HelpCommand`.
@@ -1201,7 +1198,7 @@ class MinimalHelpCommand(HelpCommand):
             f"You can also use `{self.context.clean_prefix}{command_name} [category]` for more info on a category."
         )
 
-    def get_command_signature(self, command: Command[Any, ..., Any]) -> str:
+    def get_command_signature(self, command: Command[Any, ..., Any], /) -> str:
         return f'{self.context.clean_prefix}{command.qualified_name} {command.signature}'
 
     def get_ending_note(self) -> str:
@@ -1216,13 +1213,17 @@ class MinimalHelpCommand(HelpCommand):
         """
         return ''
 
-    def add_bot_commands_formatting(self, commands: Sequence[Command[Any, ..., Any]], heading: str) -> None:
+    def add_bot_commands_formatting(self, commands: Sequence[Command[Any, ..., Any]], heading: str, /) -> None:
         """Adds the minified bot heading with commands to the output.
 
         The formatting should be added to the :attr:`paginator`.
 
         The default implementation is a bold underline heading followed
         by commands separated by an EN SPACE (U+2002) in the next line.
+
+        .. versionchanged:: 2.0
+
+            ``commands`` and ``heading`` parameters are now positional-only.
 
         Parameters
         -----------
@@ -1237,13 +1238,17 @@ class MinimalHelpCommand(HelpCommand):
             self.paginator.add_line(f'__**{heading}**__')
             self.paginator.add_line(joined)
 
-    def add_subcommand_formatting(self, command: Command[Any, ..., Any]) -> None:
+    def add_subcommand_formatting(self, command: Command[Any, ..., Any], /) -> None:
         """Adds formatting information on a subcommand.
 
         The formatting should be added to the :attr:`paginator`.
 
         The default implementation is the prefix and the :attr:`Command.qualified_name`
         optionally followed by an En dash and the command's :attr:`Command.short_doc`.
+
+        .. versionchanged:: 2.0
+
+            ``command`` parameter is now positional-only.
 
         Parameters
         -----------
@@ -1253,7 +1258,7 @@ class MinimalHelpCommand(HelpCommand):
         fmt = '{0}{1} \N{EN DASH} {2}' if command.short_doc else '{0}{1}'
         self.paginator.add_line(fmt.format(self.context.clean_prefix, command.qualified_name, command.short_doc))
 
-    def add_aliases_formatting(self, aliases: Sequence[str]) -> None:
+    def add_aliases_formatting(self, aliases: Sequence[str], /) -> None:
         """Adds the formatting information on a command's aliases.
 
         The formatting should be added to the :attr:`paginator`.
@@ -1263,6 +1268,10 @@ class MinimalHelpCommand(HelpCommand):
 
         This is not called if there are no aliases to format.
 
+        .. versionchanged:: 2.0
+
+            ``aliases`` parameter is now positional-only.
+
         Parameters
         -----------
         aliases: Sequence[:class:`str`]
@@ -1270,8 +1279,12 @@ class MinimalHelpCommand(HelpCommand):
         """
         self.paginator.add_line(f'**{self.aliases_heading}** {", ".join(aliases)}', empty=True)
 
-    def add_command_formatting(self, command: Command[Any, ..., Any]) -> None:
+    def add_command_formatting(self, command: Command[Any, ..., Any], /) -> None:
         """A utility function to format commands and groups.
+
+        .. versionchanged:: 2.0
+
+            ``command`` parameter is now positional-only.
 
         Parameters
         ------------
@@ -1306,11 +1319,11 @@ class MinimalHelpCommand(HelpCommand):
         else:
             return ctx.channel
 
-    async def prepare_help_command(self, ctx: Context[BotT], command: str) -> None:
+    async def prepare_help_command(self, ctx: ContextT, command: Optional[str] = None, /) -> None:
         self.paginator.clear()
         await super().prepare_help_command(ctx, command)
 
-    async def send_bot_help(self, mapping: Mapping[Optional[Cog], List[Command[Any, ..., Any]]]) -> None:
+    async def send_bot_help(self, mapping: Mapping[Optional[Cog], List[Command[Any, ..., Any]]], /) -> None:
         ctx = self.context
         bot = ctx.bot
 
@@ -1341,7 +1354,7 @@ class MinimalHelpCommand(HelpCommand):
 
         await self.send_pages()
 
-    async def send_cog_help(self, cog: Cog) -> None:
+    async def send_cog_help(self, cog: Cog, /) -> None:
         bot = self.context.bot
         if bot.description:
             self.paginator.add_line(bot.description, empty=True)
@@ -1366,7 +1379,7 @@ class MinimalHelpCommand(HelpCommand):
 
         await self.send_pages()
 
-    async def send_group_help(self, group: Group[Any, ..., Any]) -> None:
+    async def send_group_help(self, group: Group[Any, ..., Any], /) -> None:
         self.add_command_formatting(group)
 
         filtered = await self.filter_commands(group.commands, sort=self.sort_commands)
@@ -1386,7 +1399,7 @@ class MinimalHelpCommand(HelpCommand):
 
         await self.send_pages()
 
-    async def send_command_help(self, command: Command[Any, ..., Any]) -> None:
+    async def send_command_help(self, command: Command[Any, ..., Any], /) -> None:
         self.add_command_formatting(command)
         self.paginator.close_page()
         await self.send_pages()

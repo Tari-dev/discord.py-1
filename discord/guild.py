@@ -1601,7 +1601,7 @@ class Guild(Hashable):
             The new name of the guild.
         description: Optional[:class:`str`]
             The new description of the guild. Could be ``None`` for no description.
-            This is only available to guilds that contain ``PUBLIC`` in :attr:`Guild.features`.
+            This is only available to guilds that contain ``COMMUNITY`` in :attr:`Guild.features`.
         icon: :class:`bytes`
             A :term:`py:bytes-like object` representing the icon. Only PNG/JPEG is supported.
             GIF is only available to guilds that contain ``ANIMATED_ICON`` in :attr:`Guild.features`.
@@ -1646,11 +1646,11 @@ class Guild(Hashable):
             The new preferred locale for the guild. Used as the primary language in the guild.
         rules_channel: Optional[:class:`TextChannel`]
             The new channel that is used for rules. This is only available to
-            guilds that contain ``PUBLIC`` in :attr:`Guild.features`. Could be ``None`` for no rules
+            guilds that contain ``COMMUNITY`` in :attr:`Guild.features`. Could be ``None`` for no rules
             channel.
         public_updates_channel: Optional[:class:`TextChannel`]
             The new channel that is used for public updates from Discord. This is only available to
-            guilds that contain ``PUBLIC`` in :attr:`Guild.features`. Could be ``None`` for no
+            guilds that contain ``COMMUNITY`` in :attr:`Guild.features`. Could be ``None`` for no
             public updates channel.
         premium_progress_bar_enabled: :class:`bool`
             Whether the premium AKA server boost level progress bar should be enabled for the guild.
@@ -1897,11 +1897,6 @@ class Guild(Hashable):
 
             async for member in guild.fetch_members(limit=150):
                 print(member.name)
-
-        Flattening into a list ::
-
-            members = await guild.fetch_members(limit=150).flatten()
-            # members is now a list of Member...
         """
 
         if not self._state._intents.members:
@@ -3066,7 +3061,7 @@ class Guild(Hashable):
         user: Snowflake,
         *,
         reason: Optional[str] = None,
-        delete_message_days: Literal[0, 1, 2, 3, 4, 5, 6, 7] = 1,
+        delete_message_days: int = 1,
     ) -> None:
         """|coro|
 
@@ -3390,7 +3385,7 @@ class Guild(Hashable):
 
         await self._state.http.edit_widget(self.id, payload=payload, reason=reason)
 
-    async def chunk(self, *, cache: bool = True) -> None:
+    async def chunk(self, *, cache: bool = True) -> List[Member]:
         """|coro|
 
         Requests all members that belong to this guild. In order to use this,
@@ -3409,13 +3404,20 @@ class Guild(Hashable):
         -------
         ClientException
             The members intent is not enabled.
+
+        Returns
+        --------
+        List[:class:`Member`]
+            The list of members in the guild.
         """
 
         if not self._state._intents.members:
             raise ClientException('Intents.members must be enabled to use this.')
 
         if not self._state.is_guild_evicted(self):
-            await self._state.chunk_guild(self, cache=cache)
+            return await self._state.chunk_guild(self, cache=cache)
+
+        return []
 
     async def query_members(
         self,
@@ -3431,7 +3433,7 @@ class Guild(Hashable):
         Request members that belong to this guild whose username starts with
         the query given.
 
-        This is a websocket operation and can be slow.
+        This is a websocket operation.
 
         .. versionadded:: 1.3
 
