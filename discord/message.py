@@ -40,7 +40,6 @@ from typing import (
     Callable,
     Tuple,
     ClassVar,
-    Optional,
     Type,
     overload,
 )
@@ -85,7 +84,7 @@ if TYPE_CHECKING:
     from .types.embed import Embed as EmbedPayload
     from .types.gateway import MessageReactionRemoveEvent, MessageUpdateEvent
     from .abc import Snowflake
-    from .abc import GuildChannel, PartialMessageableChannel, MessageableChannel
+    from .abc import GuildChannel, MessageableChannel
     from .components import Component
     from .state import ConnectionState
     from .channel import TextChannel
@@ -507,7 +506,7 @@ class MessageReference:
             result['guild_id'] = self.guild_id
         if self.fail_if_not_exists is not None:
             result['fail_if_not_exists'] = self.fail_if_not_exists
-        return result  # type: ignore - Type checker doesn't understand these are the same.
+        return result  # type: ignore # Type checker doesn't understand these are the same.
 
     to_message_reference_dict = to_dict
 

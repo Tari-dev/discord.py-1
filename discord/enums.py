@@ -128,7 +128,7 @@ class EnumMeta(type):
         attrs['_enum_member_names_'] = member_names
         attrs['_enum_value_cls_'] = value_cls
         actual_cls = super().__new__(cls, name, bases, attrs)
-        value_cls._actual_enum_cls_ = actual_cls  # type: ignore - Runtime attribute isn't understood
+        value_cls._actual_enum_cls_ = actual_cls  # type: ignore # Runtime attribute isn't understood
         return actual_cls
 
     def __iter__(cls) -> Iterator[Any]:
@@ -191,7 +191,6 @@ class ChannelType(Enum):
     group = 3
     category = 4
     news = 5
-    store = 6
     news_thread = 10
     public_thread = 11
     private_thread = 12
@@ -678,7 +677,7 @@ class AppCommandType(Enum):
 
 
 def create_unknown_value(cls: Type[E], val: Any) -> E:
-    value_cls = cls._enum_value_cls_  # type: ignore - This is narrowed below
+    value_cls = cls._enum_value_cls_  # type: ignore # This is narrowed below
     name = f'unknown_{val}'
     return value_cls(name=name, value=val)
 
@@ -690,6 +689,6 @@ def try_enum(cls: Type[E], val: Any) -> E:
     """
 
     try:
-        return cls._enum_value_map_[val]  # type: ignore - All errors are caught below
+        return cls._enum_value_map_[val]  # type: ignore # All errors are caught below
     except (KeyError, TypeError, AttributeError):
         return create_unknown_value(cls, val)
