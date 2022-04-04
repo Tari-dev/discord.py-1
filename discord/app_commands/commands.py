@@ -148,7 +148,7 @@ def validate_name(name: str) -> str:
     match = VALID_SLASH_COMMAND_NAME.match(name)
     if match is None:
         raise ValueError(
-            'names must be between 1-32 characters and contain only lower-case letters, hyphens, or underscores.'
+            'names must be between 1-32 characters and contain only lower-case letters, numbers, hyphens, or underscores.'
         )
 
     # Ideally, name.islower() would work instead but since certain characters
@@ -167,12 +167,20 @@ def validate_context_menu_name(name: str) -> str:
 
 
 def _validate_auto_complete_callback(
-    callback: AutocompleteCallback[GroupT, ChoiceT]
+    callback: AutocompleteCallback[GroupT, ChoiceT],
+    skip_binding: bool = False,
 ) -> AutocompleteCallback[GroupT, ChoiceT]:
 
-    requires_binding = is_inside_class(callback)
-    required_parameters = 2 + requires_binding
+    binding = getattr(callback, '__self__', None)
+    if binding is not None:
+        callback = callback.__func__
+
+    requires_binding = (binding is None and is_inside_class(callback)) or skip_binding
+
     callback.requires_binding = requires_binding
+    callback.binding = binding
+
+    required_parameters = 2 + requires_binding
     params = inspect.signature(callback).parameters
     if len(params) != required_parameters:
         raise TypeError('autocomplete callback requires either 2 or 3 parameters to be passed')
@@ -237,6 +245,7 @@ def _populate_renames(params: Dict[str, CommandParameter], renames: Dict[str, st
         if name in rename_map:
             raise ValueError(f'{new_name} is already used')
 
+        new_name = validate_name(new_name)
         rename_map[name] = new_name
         params[name]._rename = new_name
 
@@ -580,8 +589,9 @@ class Command(Generic[GroupT, P, T]):
             raise CommandSignatureMismatch(self)
 
         if param.autocomplete.requires_binding:
-            if self.binding is not None:
-                choices = await param.autocomplete(self.binding, interaction, value)
+            binding = param.autocomplete.binding or self.binding
+            if binding is not None:
+                choices = await param.autocomplete(binding, interaction, value)
             else:
                 raise TypeError('autocomplete parameter expected a bound self parameter but one was not provided')
         else:
@@ -970,6 +980,7 @@ class Group:
         self.name: str = validate_name(name) if name is not MISSING else cls.__discord_app_commands_group_name__
         self.description: str = description or cls.__discord_app_commands_group_description__
         self._attr: Optional[str] = None
+        self._owner_cls: Optional[Type[Any]] = None
         self._guild_ids: Optional[List[int]] = guild_ids
 
         if not self.description:
@@ -1003,12 +1014,15 @@ class Group:
             if copy._attr and not cls.__discord_app_commands_skip_init_binding__:
                 setattr(self, copy._attr, copy)
 
-        if parent is not None and parent.parent is not None:
-            raise ValueError('groups can only be nested at most one level')
+        if parent is not None:
+            if parent.parent is not None:
+                raise ValueError('groups can only be nested at most one level')
+            parent.add_command(self)
 
     def __set_name__(self, owner: Type[Any], name: str) -> None:
         self._attr = name
         self.module = owner.__module__
+        self._owner_cls = owner
 
     def _copy_with(
         self,
@@ -1028,6 +1042,7 @@ class Group:
         copy.parent = parent
         copy.module = self.module
         copy._attr = self._attr
+        copy._owner_cls = self._owner_cls
         copy._children = {}
 
         bindings[self] = copy
@@ -1036,6 +1051,12 @@ class Group:
             child_copy = child._copy_with(parent=copy, binding=binding, bindings=bindings)
             child_copy.parent = copy
             copy._children[child_copy.name] = child_copy
+
+            if isinstance(child_copy, Group) and child_copy._attr and set_on_binding:
+                if binding.__class__ is child_copy._owner_cls:
+                    setattr(binding, child_copy._attr, child_copy)
+                elif child_copy._owner_cls is copy.__class__:
+                    setattr(copy, child_copy._attr, child_copy)
 
         if copy._attr and set_on_binding:
             setattr(parent or binding, copy._attr, copy)

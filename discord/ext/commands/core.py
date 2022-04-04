@@ -619,10 +619,10 @@ class Command(_BaseCommand, Generic[CogT, P, T]):
 
         previous = view.index
         if consume_rest_is_special:
-            argument = view.read_rest().strip()
+            ctx.current_argument = argument = view.read_rest().strip()
         else:
             try:
-                argument = view.get_quoted_word()
+                ctx.current_argument = argument = view.get_quoted_word()
             except ArgumentParsingError as exc:
                 if self._is_typing_optional(param.annotation):
                     view.index = previous
@@ -645,7 +645,7 @@ class Command(_BaseCommand, Generic[CogT, P, T]):
 
             view.skip_ws()
             try:
-                argument = view.get_quoted_word()
+                ctx.current_argument = argument = view.get_quoted_word()
                 value = await run_converters(ctx, converter, argument, param)  # type: ignore
             except (CommandError, ArgumentParsingError):
                 view.index = previous
@@ -661,7 +661,7 @@ class Command(_BaseCommand, Generic[CogT, P, T]):
         view = ctx.view
         previous = view.index
         try:
-            argument = view.get_quoted_word()
+            ctx.current_argument = argument = view.get_quoted_word()
             value = await run_converters(ctx, converter, argument, param)  # type: ignore
         except (CommandError, ArgumentParsingError):
             view.index = previous
@@ -769,7 +769,7 @@ class Command(_BaseCommand, Generic[CogT, P, T]):
                 # kwarg only param denotes "consume rest" semantics
                 if self.rest_is_raw:
                     converter = get_converter(param)
-                    argument = view.read_rest()
+                    ctx.current_argument = argument = view.read_rest()
                     kwargs[name] = await run_converters(ctx, converter, argument, param)
                 else:
                     kwargs[name] = await self.transform(ctx, param)

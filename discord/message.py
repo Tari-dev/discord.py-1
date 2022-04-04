@@ -48,7 +48,7 @@ from . import utils
 from .reaction import Reaction
 from .emoji import Emoji
 from .partial_emoji import PartialEmoji
-from .enums import MessageType, ChannelType, try_enum
+from .enums import InteractionType, MessageType, ChannelType, try_enum
 from .errors import HTTPException
 from .components import _component_factory
 from .embeds import Embed
@@ -73,6 +73,8 @@ if TYPE_CHECKING:
         MessageApplication as MessageApplicationPayload,
         MessageActivity as MessageActivityPayload,
     )
+
+    from .types.interactions import MessageInteraction as MessageInteractionPayload
 
     from .types.components import Component as ComponentPayload
     from .types.threads import ThreadArchiveDuration
@@ -100,6 +102,7 @@ __all__ = (
     'Attachment',
     'Message',
     'PartialMessage',
+    'MessageInteraction',
     'MessageReference',
     'DeletedReferencedMessage',
 )
@@ -511,6 +514,67 @@ class MessageReference:
     to_message_reference_dict = to_dict
 
 
+class MessageInteraction(Hashable):
+    """Represents the interaction that a :class:`Message` is a response to.
+
+    .. versionadded:: 2.0
+
+    .. container:: operations
+
+        .. describe:: x == y
+
+            Checks if two message interactions are equal.
+
+        .. describe:: x != y
+
+            Checks if two message interactions are not equal.
+
+        .. describe:: hash(x)
+
+            Returns the message interaction's hash.
+
+    Attributes
+    -----------
+    id: :class:`int`
+        The interaction ID.
+    type: :class:`InteractionType`
+        The interaction type.
+    name: :class:`str`
+        The name of the interaction.
+    user: Union[:class:`User`, :class:`Member`]
+        The user or member that invoked the interaction.
+    """
+
+    __slots__: Tuple[str, ...] = ('id', 'type', 'name', 'user')
+
+    def __init__(self, *, state: ConnectionState, guild: Optional[Guild], data: MessageInteractionPayload) -> None:
+        self.id: int = int(data['id'])
+        self.type: InteractionType = try_enum(InteractionType, data['type'])
+        self.name: str = data['name']
+        self.user: Union[User, Member] = MISSING
+
+        try:
+            payload = data['member']
+        except KeyError:
+            self.user = state.create_user(data['user'])
+        else:
+            if guild is None:
+                # This is an unfortunate data loss, but it's better than giving bad data
+                # This is also an incredibly rare scenario.
+                self.user = state.create_user(data['user'])
+            else:
+                payload['user'] = data['user']
+                self.user = Member(data=payload, guild=guild, state=state)  # type: ignore
+
+    def __repr__(self) -> str:
+        return f'<MessageInteraction id={self.id} name={self.name!r} type={self.type!r} user={self.user!r}>'
+
+    @property
+    def created_at(self) -> datetime.datetime:
+        """:class:`datetime.datetime`: The interaction's creation time in UTC."""
+        return utils.snowflake_time(self.id)
+
+
 def flatten_handlers(cls: Type[Message]) -> Type[Message]:
     prefix = len('_handle_')
     handlers = [
@@ -534,6 +598,7 @@ class PartialMessage(Hashable):
     the constructor itself, and the second is via the following:
 
     - :meth:`TextChannel.get_partial_message`
+    - :meth:`VoiceChannel.get_partial_message`
     - :meth:`Thread.get_partial_message`
     - :meth:`DMChannel.get_partial_message`
 
@@ -557,7 +622,7 @@ class PartialMessage(Hashable):
 
     Attributes
     -----------
-    channel: Union[:class:`PartialMessageable`, :class:`TextChannel`, :class:`Thread`, :class:`DMChannel`]
+    channel: Union[:class:`PartialMessageable`, :class:`TextChannel`, :class:`VoiceChannel`, :class:`Thread`, :class:`DMChannel`]
         The channel associated with this partial message.
     id: :class:`int`
         The message ID.
@@ -577,7 +642,9 @@ class PartialMessage(Hashable):
             ChannelType.public_thread,
             ChannelType.private_thread,
         ):
-            raise TypeError(f'Expected PartialMessageable, TextChannel, DMChannel or Thread not {type(channel)!r}')
+            raise TypeError(
+                f'expected PartialMessageable, TextChannel, VoiceChannel, DMChannel or Thread not {type(channel)!r}'
+            )
 
         self.channel: MessageableChannel = channel
         self._state: ConnectionState = channel._state
@@ -1177,7 +1244,7 @@ class Message(PartialMessage, Hashable):
         This is not stored long term within Discord's servers and is only used ephemerally.
     embeds: List[:class:`Embed`]
         A list of embeds the message has.
-    channel: Union[:class:`TextChannel`, :class:`Thread`, :class:`DMChannel`, :class:`GroupChannel`, :class:`PartialMessageable`]
+    channel: Union[:class:`TextChannel`, :class:`VoiceChannel`, :class:`Thread`, :class:`DMChannel`, :class:`GroupChannel`, :class:`PartialMessageable`]
         The :class:`TextChannel` or :class:`Thread` that the message was sent from.
         Could be a :class:`DMChannel` or :class:`GroupChannel` if it's a private message.
     reference: Optional[:class:`~discord.MessageReference`]
@@ -1253,6 +1320,10 @@ class Message(PartialMessage, Hashable):
         A list of components in the message.
 
         .. versionadded:: 2.0
+    interaction: Optional[:class:`MessageInteraction`]
+        The interaction that this message is a response to.
+
+        .. versionadded:: 2.0
     guild: Optional[:class:`Guild`]
         The guild that the message belongs to, if applicable.
     """
@@ -1286,6 +1357,7 @@ class Message(PartialMessage, Hashable):
         'activity',
         'stickers',
         'components',
+        'interaction',
     )
 
     if TYPE_CHECKING:
@@ -1304,7 +1376,8 @@ class Message(PartialMessage, Hashable):
         channel: MessageableChannel,
         data: MessagePayload,
     ) -> None:
-        super().__init__(channel=channel, id=int(data['id']))
+        self.channel: MessageableChannel = channel
+        self.id: int = int(data['id'])
         self._state: ConnectionState = state
         self.webhook_id: Optional[int] = utils._get_as_snowflake(data, 'webhook_id')
         self.reactions: List[Reaction] = [Reaction(message=self, data=d) for d in data.get('reactions', [])]
@@ -1329,6 +1402,15 @@ class Message(PartialMessage, Hashable):
             self.guild = channel.guild  # type: ignore
         except AttributeError:
             self.guild = state._get_guild(utils._get_as_snowflake(data, 'guild_id'))
+
+        self.interaction: Optional[MessageInteraction] = None
+
+        try:
+            interaction = data['interaction']
+        except KeyError:
+            pass
+        else:
+            self.interaction = MessageInteraction(state=state, guild=self.guild, data=interaction)
 
         try:
             ref = data['message_reference']
@@ -1528,6 +1610,9 @@ class Message(PartialMessage, Hashable):
 
     def _handle_components(self, components: List[ComponentPayload]):
         self.components = [_component_factory(d) for d in components]
+
+    def _handle_interaction(self, data: MessageInteractionPayload):
+        self.interaction = MessageInteraction(state=self._state, guild=self.guild, data=data)
 
     def _rebind_cached_references(self, new_guild: Guild, new_channel: Union[TextChannel, Thread]) -> None:
         self.guild = new_guild
